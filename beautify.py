@@ -2110,16 +2110,13 @@ def process_subject_custom(
     cv2.imwrite(os.path.join(OUT_DIR, f"{stem}_after.png"), after_d["image"])
     save_triptych_figure(stem, original, targets_img, after_d["image"], OUT_DIR)
     save_professor_figure(stem, original, after_d, OUT_DIR)
-    save_comparison_figure(stem, original, before_d, after_d, OUT_DIR)
     save_pipeline_figure(stem, original, after_d, OUT_DIR)
     save_filter_figure(stem, before_d, after_d, OUT_DIR)
-    save_hist_figure(stem, original, before_d["image"], after_d["image"], OUT_DIR)
     save_difference_map(
         stem, original, before_d["image"], after_d["image"], OUT_DIR,
         analysis=after_d.get("analysis"),
     )
     save_spectrum_figure(stem, original, before_d["image"], after_d["image"], OUT_DIR)
-    save_rgb_channel_figure(stem, original, before_d["image"], after_d["image"], OUT_DIR)
     mb = compute_metrics(original, before_d["image"])
     ma = compute_metrics(original, after_d["image"])
     print(f"  Before - PSNR:{mb['PSNR']:.2f} dB  SSIM:{mb['SSIM']:.4f}")
