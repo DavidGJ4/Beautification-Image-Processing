@@ -40,8 +40,8 @@ PORTRAIT_JOBS = [
 FACE_CONF = 0.55
 
 
-# face-smoothing-main reference HSV range (configs.yaml)
-HSV_SKIN_LOW = np.array([0, 80, 80], dtype=np.uint8)
+# face-smoothing-main reference HSV range (configs.yaml), sat lowered for highlight cheeks
+HSV_SKIN_LOW = np.array([0, 70, 70], dtype=np.uint8)
 HSV_SKIN_HIGH = np.array([200, 255, 255], dtype=np.uint8)
 
 
@@ -354,9 +354,18 @@ def _roi_edge_feather(roi_shape: Tuple[int, int]) -> np.ndarray:
 
 
 def build_hsv_skin_mask_roi(roi_bgr: np.ndarray) -> np.ndarray:
-    """HSV skin mask inside face ROI only (face-smoothing configs.yaml)."""
+    """HSV + YCrCb skin mask inside face ROI, with morph close to fill cheek holes."""
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-    return cv2.inRange(hsv, HSV_SKIN_LOW, HSV_SKIN_HIGH)
+    hsv_mask = cv2.inRange(hsv, HSV_SKIN_LOW, HSV_SKIN_HIGH)
+    ycrcb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2YCrCb)
+    ycrcb_mask = cv2.inRange(
+        ycrcb, np.array([0, 133, 77], dtype=np.uint8), np.array([255, 173, 127], dtype=np.uint8),
+    )
+    combined = cv2.bitwise_or(hsv_mask, ycrcb_mask)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, k, iterations=2)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, k, iterations=1)
+    return combined
 
 
 def build_skin_mask(bgr: np.ndarray, geom: FaceGeometry) -> np.ndarray:
@@ -1259,9 +1268,9 @@ def _exclude_features(mask: np.ndarray, geom: FaceGeometry, shape: Tuple[int, in
 
 def _exclude_acne_zones(mask: np.ndarray, geom: FaceGeometry, shape: Tuple[int, int]) -> np.ndarray:
     out = _exclude_features(mask, geom, shape)
-    # mouth/chin only — keep nose-flank cheeks (0.40/0.60) for pimples beside nose
+    # lip + chin only — philtrum / lower nose can keep pimple targets
     for nx, ny, rx, ry in (
-        (0.50, 0.66, 0.30, 0.11), (0.50, 0.76, 0.22, 0.10),
+        (0.50, 0.73, 0.14, 0.05), (0.50, 0.78, 0.18, 0.08),
     ):
         zone = geom.ellipse_mask(shape, nx, ny, rx, ry)
         out = cv2.bitwise_and(out, cv2.bitwise_not(zone))
@@ -1345,19 +1354,24 @@ def _acne_target_mask(
     return _exclude_acne_zones(out, geom, shape)
 
 
+def _acne_lip_protect_mask(geom: FaceGeometry, shape: Tuple[int, int]) -> np.ndarray:
+    """Lips only — philtrum and lower nose stay in the acne blend."""
+    lip_zone = geom.ellipse_mask(shape, 0.50, 0.73, 0.14, 0.05)
+    return _soft_mask(lip_zone, 15)
+
+
 def _safe_skin_mask_acne(analysis: FaceAnalysis, shape: Tuple[int, int]) -> np.ndarray:
     x1, y1, x2, y2 = analysis.geom.bbox
     face_skin = np.zeros(shape, dtype=np.uint8)
     face_skin[y1:y2, x1:x2] = analysis.skin_mask[y1:y2, x1:x2]
     skin_f = _soft_mask(face_skin, 29)
-    mouth_zone = analysis.geom.ellipse_mask(shape, 0.50, 0.70, 0.28, 0.12)
-    return skin_f * (1.0 - _soft_mask(mouth_zone, 21))
+    return skin_f * (1.0 - _acne_lip_protect_mask(analysis.geom, shape))
 
 
 def restore_before_acne(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.ndarray, float]:
-    skin_mask = analysis.skin_mask
-    skin_f = _soft_mask(skin_mask, 27)
-    skin_px = skin_mask > 0
+    shape = bgr.shape[:2]
+    skin_f = _safe_skin_mask_acne(analysis, shape)
+    skin_px = analysis.skin_mask > 0
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float64)
     L, a, b = lab[:, :, 0], lab[:, :, 1], lab[:, :, 2]
     sigma_lp = 12.0
@@ -1487,12 +1501,12 @@ def _skin_face_oval_u8(
     ys, xs = np.where(skin)
     dnx, dny = _skin_norm_offset(geom, skin_mask)
     if len(xs) >= 50:
-        cx = int(xs.mean())
-        cy = int(ys.mean())
+        cx = int(0.45 * xs.mean() + 0.55 * geom.cx)
+        cy = int(0.45 * ys.mean() + 0.55 * geom.cy)
         x_span = int(xs.max() - xs.min())
         y_span = int(ys.max() - ys.min())
-        rx = max(int(x_span * 0.60), int(geom.fw * 0.54), 1)
-        ry = max(int(y_span * 0.58), int(geom.fh * 0.56), 1)
+        rx = max(int(x_span * 0.62), int(geom.fw * 0.56), 1)
+        ry = max(int(y_span * 0.60), int(geom.fh * 0.58), 1)
         chin_y = int(geom.point(0.50 + dnx, 0.90 + dny)[1])
     else:
         cx, cy = geom.cx, geom.cy
@@ -1539,6 +1553,7 @@ def _blend_skin_mask_u8(
     border = cv2.bitwise_and(face, cv2.bitwise_not(inner))
     skin_near = cv2.dilate(skin_mask, k9, iterations=4)
     border_keep = cv2.bitwise_and(border, skin_near)
+    # keep full inner oval even when HSV missed a cheek patch
     return cv2.bitwise_or(inner, border_keep)
 
 
@@ -1554,23 +1569,65 @@ def _blend_skin_weights(
     composite_w = composite_w * edge
     process_w = composite_w.copy()
     lum = cv2.cvtColor(analysis.bgr, cv2.COLOR_BGR2GRAY).astype(np.float64)
-    bg = (lum < 36.0) | ((lum > 170.0) & (lum < 210.0))
+    sat = cv2.cvtColor(analysis.bgr, cv2.COLOR_BGR2HSV)[:, :, 1].astype(np.float64)
+    # wall = bright and desaturated; keep saturated highlight cheeks inside face mask
+    bg = (lum < 36.0) | ((lum > 170.0) & (lum < 210.0) & (sat < 50.0))
+    face_keep = base_u8 > 96
+    bg = bg & ~face_keep
     composite_w[bg] = 0.0
     process_w[bg] = 0.0
     return np.clip(composite_w, 0.0, 1.0), np.clip(process_w, 0.0, 1.0)
 
 
-def _brow_protect_mask(
-    geom: FaceGeometry, shape: Tuple[int, int], skin_mask: np.ndarray | None = None,
+def _brow_search_roi_u8(
+    geom: FaceGeometry, shape: Tuple[int, int], dnx: float, dny: float,
 ) -> np.ndarray:
-    dnx, dny = _skin_norm_offset(geom, skin_mask) if skin_mask is not None else (0.0, 0.0)
-    out = np.zeros(shape, dtype=np.float64)
+    """Loose ROI where brow detection runs — not the brow shape itself."""
+    out = np.zeros(shape, dtype=np.uint8)
     for nx in (0.34 + dnx, 0.66 + dnx):
-        brow = _soft_mask(
-            geom.ellipse_mask(shape, nx, 0.334 + dny, 0.078, 0.022), 5,
+        out = cv2.bitwise_or(
+            out, geom.ellipse_mask(shape, nx, 0.330 + dny, 0.11, 0.050),
         )
-        out = np.clip(out + brow, 0.0, 1.0)
     return out
+
+
+def _detect_brow_mask_u8(
+    bgr: np.ndarray, geom: FaceGeometry, skin_mask: np.ndarray, shape: Tuple[int, int],
+) -> np.ndarray:
+    """Find actual brow hairs in the original — dark / brown pixels in brow ROI."""
+    dnx, dny = _skin_norm_offset(geom, skin_mask)
+    search = _brow_search_roi_u8(geom, shape, dnx, dny)
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    L = lab[:, :, 0].astype(np.float32)
+    a_ch = lab[:, :, 1].astype(np.float32)
+    b_ch = lab[:, :, 2].astype(np.float32)
+    L_loc = cv2.GaussianBlur(L, (0, 0), 13.0)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    darker = (L < L_loc - 6.0) | (L < 92.0)
+    brown = (b_ch > 106.0) & (a_ch > 112.0) & (a_ch < 150.0) & (L < 118.0)
+    black_hair = (gray < 78) & (L < 78.0)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    skin_like = cv2.inRange(hsv, HSV_SKIN_LOW, HSV_SKIN_HIGH)
+    brow_raw = ((darker & (brown | black_hair)) & (skin_like == 0)).astype(np.uint8) * 255
+    brow_raw = cv2.bitwise_and(brow_raw, search)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    brow_raw = cv2.morphologyEx(brow_raw, cv2.MORPH_CLOSE, k, iterations=2)
+    brow_raw = cv2.dilate(brow_raw, k, iterations=1)
+    if cv2.countNonZero(brow_raw) < 60:
+        edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 35, 110)
+        brow_raw = cv2.bitwise_and(edges, search)
+        brow_raw = cv2.dilate(brow_raw, k, iterations=2)
+    return brow_raw
+
+
+def _brow_soft_mask(
+    bgr: np.ndarray, geom: FaceGeometry, skin_mask: np.ndarray, shape: Tuple[int, int],
+) -> np.ndarray:
+    """Soft weight map from detected brow hairs (not fixed ovals)."""
+    raw = _detect_brow_mask_u8(bgr, geom, skin_mask, shape)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    raw = cv2.dilate(raw, k, iterations=1)
+    return _soft_mask(raw, 5)
 
 
 def _freckle_bp_mask(bgr: np.ndarray, skin_mask: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
@@ -1589,9 +1646,10 @@ def _freckle_target_mask(
     compact = _filter_small_flaw_blobs(flaw_mask, shape, compact_only=False)
     merged = cv2.bitwise_or(compact, bp)
     merged = _exclude_features(merged, geom, shape)
-    for nx in (0.34, 0.66):
-        brow = geom.ellipse_mask(shape, nx, 0.334, 0.078, 0.028)
-        merged = cv2.bitwise_and(merged, cv2.bitwise_not(brow))
+    brow_u8 = _detect_brow_mask_u8(bgr, geom, skin_mask, shape)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    brow_u8 = cv2.dilate(brow_u8, k, iterations=2)
+    merged = cv2.bitwise_and(merged, cv2.bitwise_not(brow_u8))
     for nx in (0.11, 0.89):
         ear = geom.ellipse_mask(shape, nx, 0.48, 0.055, 0.11)
         merged = cv2.bitwise_and(merged, cv2.bitwise_not(ear))
@@ -1663,6 +1721,9 @@ def _lip_gradient_mask(
     ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
     lip_cr = (ycrcb[:, :, 1].astype(np.float32) > 142.0).astype(np.uint8) * 255
     lip_raw = cv2.bitwise_and(cv2.bitwise_or(lip_hsv, cv2.bitwise_or(lip_a, lip_cr)), mouth)
+    local_a = cv2.GaussianBlur(lab[:, :, 1].astype(np.float32), (21, 21), 0)
+    lip_excess = (lab[:, :, 1].astype(np.float32) > local_a + 5.5).astype(np.uint8) * 255
+    lip_raw = cv2.bitwise_and(lip_raw, lip_excess)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     lip_raw = cv2.morphologyEx(lip_raw, cv2.MORPH_CLOSE, k, iterations=2)
     lip_raw = cv2.dilate(lip_raw, k, iterations=1)
@@ -1670,13 +1731,21 @@ def _lip_gradient_mask(
         return _lip_geometry_mask(geom, shape, dnx, dny)
     lip_f = cv2.GaussianBlur(lip_raw.astype(np.float32), (17, 17), 0) / 255.0
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
-    rx = max(geom.fw * 0.11, 1.0)
-    ry = max(geom.fh * 0.042, 1.0)
+    rx = max(geom.fw * 0.072, 1.0)
+    ry = max(geom.fh * 0.034, 1.0)
     radial = np.exp(-0.5 * (((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2))
+    x_coords = np.arange(w, dtype=np.float64)
+    horiz = np.exp(-0.5 * ((x_coords - cx) / max(geom.fw * 0.058, 1.0)) ** 2)
     vert = np.exp(-0.5 * ((yy - cy) / (ry * 1.12)) ** 2)
-    grad = lip_f * radial * (0.55 + 0.45 * vert)
+    mouth_top = cy - int(geom.fh * 0.012)
+    upper_cut = np.clip((yy - mouth_top) / max(geom.fh * 0.018, 1.0), 0.0, 1.0)
+    grad = lip_f * radial * vert * horiz[np.newaxis, :] * upper_cut
+    left_upper = _soft_mask(
+        geom.ellipse_mask(shape, 0.44 + dnx, 0.668 + dny, 0.068, 0.048), 13,
+    )
+    grad = np.ascontiguousarray(grad * (1.0 - left_upper), dtype=np.float32)
     return np.clip(
-        cv2.GaussianBlur(grad.astype(np.float32), (11, 11), 0).astype(np.float64),
+        cv2.GaussianBlur(grad, (11, 11), 0).astype(np.float64),
         0.0, 1.0,
     )
 
@@ -1692,6 +1761,10 @@ def _apply_lip_red_gradient(
     """Post-blend lip reddening — independent of skin composite weights."""
     shape = result_bgr.shape[:2]
     lip_w = _lip_gradient_mask(original_bgr, geom, skin_mask, shape, dnx, dny)
+    left_upper = _soft_mask(
+        geom.ellipse_mask(shape, 0.44 + dnx, 0.668 + dny, 0.068, 0.048), 13,
+    )
+    lip_w = lip_w * (1.0 - left_upper)
     if float(np.max(lip_w)) < 0.04:
         return result_bgr
     lab_r = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2LAB).astype(np.float64)
@@ -1705,6 +1778,57 @@ def _apply_lip_red_gradient(
     lab_r[:, :, 1] = lab_r[:, :, 1] * (1.0 - strength) + a_lip * strength
     lab_r[:, :, 2] = lab_r[:, :, 2] * (1.0 - strength) + b_lip * strength
     return cv2.cvtColor(clip_to_uint8(lab_r), cv2.COLOR_LAB2BGR)
+
+
+def _porcelain_even_mouth_flanks(
+    result_bgr: np.ndarray,
+    original_bgr: np.ndarray,
+    geom: FaceGeometry,
+    process_w: np.ndarray,
+    dnx: float,
+    dny: float,
+) -> np.ndarray:
+    """Even small red/bright patches beside the mouth into surrounding skin tone."""
+    shape = result_bgr.shape[:2]
+    lab_r = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2LAB).astype(np.float64)
+    L, a, b = lab_r[:, :, 0], lab_r[:, :, 1], lab_r[:, :, 2]
+    a_local = _fft_local_skin_field(a, 10.0, 28.0)
+    b_local = _fft_local_skin_field(b, 10.0, 30.0)
+    red_spot = np.clip((a - a_local - 2.0) / 8.0, 0.0, 1.0)
+    L_blur = cv2.GaussianBlur(L.astype(np.float32), (0, 0), 14.0).astype(np.float64)
+    uneven_l = np.clip((L - L_blur - 3.0) / 14.0, 0.0, 1.0)
+    spot_w = np.clip(np.maximum(red_spot, uneven_l * 0.70), 0.0, 1.0)
+    flank = np.zeros(shape, dtype=np.float64)
+    for nx, ny in ((0.44 + dnx, 0.668 + dny), (0.60 + dnx, 0.665 + dny)):
+        flank = np.clip(
+            flank + _soft_mask(geom.ellipse_mask(shape, nx, ny, 0.062, 0.044), 11),
+            0.0, 1.0,
+        )
+    flank_w = np.clip(flank * process_w * 0.50, 0.0, 0.50)
+    spot_fix = np.clip(spot_w * flank * process_w * 0.80, 0.0, 0.80)
+    even_w = np.clip(np.maximum(flank_w, spot_fix), 0.0, 0.80)
+    even_w = cv2.GaussianBlur(even_w.astype(np.float32), (11, 11), 0).astype(np.float64)
+    L_tgt = np.clip(L_blur, 0, 255)
+    a = a * (1.0 - even_w) + a_local * even_w
+    b = b * (1.0 - even_w) + b_local * even_w
+    L = L * (1.0 - even_w) + L_tgt * even_w
+    lab_out = np.stack([np.clip(L, 0, 255), np.clip(a, 0, 255), np.clip(b, 0, 255)], axis=2)
+    return cv2.cvtColor(clip_to_uint8(lab_out), cv2.COLOR_LAB2BGR)
+
+
+def _porcelain_restore_brows(
+    result_bgr: np.ndarray,
+    original_bgr: np.ndarray,
+    geom: FaceGeometry,
+    skin_mask: np.ndarray,
+) -> np.ndarray:
+    """Post-blend: paste original brow hair color where detected in OG image."""
+    shape = result_bgr.shape[:2]
+    w = np.clip(_brow_soft_mask(original_bgr, geom, skin_mask, shape) * 0.96, 0.0, 0.96)
+    w3 = np.stack([w, w, w], axis=2)
+    return clip_to_uint8(
+        result_bgr.astype(np.float64) * (1.0 - w3) + original_bgr.astype(np.float64) * w3,
+    )
 
 
 def beautify_porcelain_fft(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.ndarray, float]:
@@ -1775,18 +1899,10 @@ def beautify_porcelain_fft(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.
         )
     L_hp = apply_frequency_filter(L_out, make_highpass_kernel(pad, 9.0))
     L_out = np.clip(L_out + L_hp * eye_sharp * 0.14, 0, 255)
-    brow_zone = _brow_protect_mask(geom, shape, analysis.skin_mask)
-    L_orig = lab[:, :, 0]
-    L_local_o = cv2.GaussianBlur(L_orig, (0, 0), 7.0)
-    hair_w = np.clip((L_local_o - L_orig + 2.5) / 9.0, 0.0, 1.0) * brow_zone
-    hair_w = cv2.GaussianBlur(hair_w.astype(np.float32), (0, 0), 2.0).astype(np.float64)
-    hair_w = np.clip(hair_w * 0.85, 0.0, 0.85)
-    L_dark = np.clip(L_orig * 0.40 + 10.0, 0, 255)
-    L_out = L_out * (1.0 - hair_w) + L_dark * hair_w
-    a_dark = a * 0.65 + 127.0 * 0.35
-    b_dark = b * 0.65 + 102.0 * 0.35
-    a_out = a_out * (1.0 - hair_w * 0.50) + a_dark * (hair_w * 0.50)
-    b_out = b_out * (1.0 - hair_w * 0.50) + b_dark * (hair_w * 0.50)
+    brow_w = _brow_soft_mask(bgr, geom, analysis.skin_mask, shape)
+    L_out = L_out * (1.0 - brow_w) + L_orig * brow_w
+    a_out = a_out * (1.0 - brow_w * 0.65) + a_orig * (brow_w * 0.65)
+    b_out = b_out * (1.0 - brow_w * 0.65) + b_orig * (brow_w * 0.65)
     lab_out = np.stack([
         np.clip(L_out, 0, 255), np.clip(a_out, 0, 255), np.clip(b_out, 0, 255),
     ], axis=2)
@@ -1796,13 +1912,20 @@ def beautify_porcelain_fft(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.
     hair_gate = np.clip((L_orig - 95.0) / (135.0 - 95.0), 0.0, 1.0)
     is_not_bg = np.clip(sat_ch / 12.0, 0.0, 1.0)
     structural_gate = hair_gate * is_not_bg
+    brow_excl = np.clip(1.0 - brow_w * 0.95, 0.0, 1.0)
     final_blend_w = cv2.GaussianBlur(
-        composite_w * structural_gate, (31, 31), 0,
+        composite_w * structural_gate * brow_excl, (31, 31), 0,
     ).astype(np.float64)
     w3 = np.stack([final_blend_w, final_blend_w, final_blend_w], axis=2)
     result = clip_to_uint8(bgr.astype(np.float64) * (1.0 - w3) + processed * w3)
     result = _apply_lip_red_gradient(
         result, bgr, geom, analysis.skin_mask, dnx, dny,
+    )
+    result = _porcelain_even_mouth_flanks(
+        result, bgr, geom, process_w, dnx, dny,
+    )
+    result = _porcelain_restore_brows(
+        result, bgr, geom, analysis.skin_mask,
     )
     return result, sigma_lp
 
