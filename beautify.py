@@ -913,37 +913,6 @@ def bgr_to_rgb(img: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-def save_comparison_figure(name, original, before_d, after_d, out_dir):
-    prof = after_d["profile"]
-    fig = plt.figure(figsize=(20, 10))
-    fig.patch.set_facecolor("#0f0f14")
-    gs = gridspec.GridSpec(2, 5, figure=fig, hspace=0.38, wspace=0.22,
-                           left=0.03, right=0.98, top=0.90, bottom=0.05)
-    tw = dict(color="white", fontsize=9, fontweight="bold", pad=5)
-    panels = [
-        (0, 0, bgr_to_rgb(original), "Original"),
-        (0, 1, bgr_to_rgb(before_d["image"]), "Before (restoration)"),
-        (0, 2, bgr_to_rgb(after_d["image"]), "After (cosmetic)"),
-        (0, 3, compute_magnitude_spectrum(original), "FFT |F(u,v)|"),
-        (0, 4, compute_magnitude_spectrum(after_d["image"]), "FFT after"),
-        (1, 0, bgr_to_rgb(before_d["lp"]), f"LP σ={prof.before_sigma_lp:.0f}"),
-        (1, 1, bgr_to_rgb(after_d["lp"]), f"LP sigma={prof.fft_sigma:.0f}"),
-        (1, 2, bgr_to_rgb(after_d["bp"]), f"BP σ {prof.sigma_mid_lo:.0f}–{prof.sigma_mid_hi:.0f}"),
-        (1, 3, bgr_to_rgb(after_d["hp"]), "HP detail layer"),
-        (1, 4, after_d["flaw_mask"], "Detected flaws"),
-    ]
-    for row, col, data, title in panels:
-        ax = fig.add_subplot(gs[row, col])
-        ax.imshow(data, cmap="gray" if data.ndim == 2 else None)
-        ax.set_title(title, **tw)
-        ax.axis("off")
-    fig.suptitle(f"Frequency-Domain Beautification — {name}", color="white", fontsize=14, y=0.97)
-    path = os.path.join(out_dir, f"{name}_comparison.png")
-    fig.savefig(path, dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    return path
-
-
 def save_triptych_figure(
     name: str,
     original: np.ndarray,
@@ -1084,25 +1053,6 @@ def save_pipeline_figure(name, original, after_d, out_dir):
     return path
 
 
-def save_hist_figure(name, original, before_img, after_img, out_dir):
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.patch.set_facecolor("#0f0f14")
-    for ax, img, title, col in zip(
-        axes,
-        [original, before_img, after_img],
-        ["Original", "Before", "After"],
-        ["#5588ff", "#ffaa33", "#33dd88"],
-    ):
-        ax.hist(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).ravel(), bins=256, range=(0, 255), color=col, alpha=0.8)
-        ax.set_title(title, color="white")
-        ax.set_facecolor("#1a1a28")
-        ax.tick_params(colors="gray")
-    path = os.path.join(out_dir, f"{name}_histograms.png")
-    fig.savefig(path, dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    return path
-
-
 def _heatmap_face_mask(
     shape: Tuple[int, int], geom: FaceGeometry, skin_mask: np.ndarray,
 ) -> np.ndarray:
@@ -1181,32 +1131,6 @@ def save_spectrum_figure(name, original, before_img, after_img, out_dir):
     ax.legend(facecolor="#1a1a28", labelcolor="white")
     ax.tick_params(colors="gray")
     path = os.path.join(out_dir, f"{name}_spectrum.png")
-    fig.savefig(path, dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    return path
-
-
-def save_rgb_channel_figure(name, original, before_img, after_img, out_dir):
-    ch_names, ch_colors = ["Blue", "Green", "Red"], ["#4488ff", "#44cc44", "#ff4444"]
-    fig = plt.figure(figsize=(18, 14))
-    fig.patch.set_facecolor("#0f0f14")
-    gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.45, wspace=0.25,
-                           left=0.05, right=0.97, top=0.93, bottom=0.05)
-    for col, (img, ct) in enumerate(zip([original, before_img, after_img], ["Original", "Before", "After"])):
-        for row, ci in enumerate(range(3)):
-            ax = fig.add_subplot(gs[row, col])
-            ax.imshow(img[:, :, ci], cmap="gray", vmin=0, vmax=255)
-            ax.set_title(f"{ct} — {ch_names[ci]}", color="white", fontsize=8)
-            ax.axis("off")
-    for ch_idx, cc in enumerate(ch_colors):
-        ax = fig.add_subplot(gs[3, ch_idx])
-        ax.set_facecolor("#1a1a28")
-        for img, lbl, ls in [(original, "Orig", "-"), (before_img, "Before", "--"), (after_img, "After", ":")]:
-            h, b = np.histogram(img[:, :, ch_idx].ravel(), bins=256, range=(0, 255))
-            ax.plot(b[:-1], h, color=cc, linestyle=ls, lw=1.2, label=lbl)
-        ax.legend(facecolor="#1a1a28", labelcolor="white", fontsize=8)
-        ax.tick_params(colors="gray")
-    path = os.path.join(out_dir, f"{name}_rgb_channels.png")
     fig.savefig(path, dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     return path
