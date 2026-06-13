@@ -1,4 +1,6 @@
-"""Frequency-domain facial beautification (HW2)."""
+""" 
+Frequency-domain Facial Beautification [HWK2] 
+"""
 
 from __future__ import annotations
 
@@ -478,12 +480,16 @@ def smooth_portrait_reference(
     wrinkle_map: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    face-smoothing-main bilateral + HSV mask inside face ROI.
+    FFT Gaussian LP skin smooth inside face ROI, blended with HSV skin mask.
     Wrinkle profile: partial blend scaled by wrinkle_strength map (not 100% skin).
     """
     output = bgr.copy()
     full_skin = np.zeros(bgr.shape[:2], dtype=np.uint8)
     bboxes = [_expand_bbox(b, bgr.shape[:2]) for b in (detect_face_bboxes(bgr) or [_fallback_face_bbox(bgr.shape[:2])])]
+    smooth_sigma = max(
+        profile.fft_sigma * (1.0 + 0.12 * max(0, profile.bilateral_passes - 1)),
+        8.0,
+    )
 
     for x1, y1, x2, y2 in bboxes:
         if x2 <= x1 or y2 <= y1:
@@ -498,12 +504,7 @@ def smooth_portrait_reference(
         if wrinkle_map is not None:
             wrinkle_roi = wrinkle_map[y1:y2, x1:x2]
 
-        blurred = roi.copy()
-        for _ in range(profile.bilateral_passes):
-            blurred = cv2.bilateralFilter(
-                blurred, profile.bilateral_d,
-                profile.bilateral_sigma_color, profile.bilateral_sigma_space,
-            )
+        blurred = clip_to_uint8(_fft_lp_bgr(roi.astype(np.float64), smooth_sigma))
 
         alpha = _adaptive_blend_alpha(skin_mask, wrinkle_roi, profile)
         alpha3 = np.stack([alpha, alpha, alpha], axis=2)
@@ -588,22 +589,16 @@ def detect_skin_flaws(
 
 
 def remove_skin_flaws(bgr: np.ndarray, flaw_mask: np.ndarray, profile: BeautyProfile) -> np.ndarray:
-    """Inpaint only small detected flaw pixels — no global whitening."""
+    """Paste FFT low-pass skin over flaw pixels — no spatial inpainting."""
     if cv2.countNonZero(flaw_mask) == 0:
         return bgr
     if is_line_flaw(profile):
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         flaw_mask = cv2.dilate(flaw_mask, k, iterations=1)
-    guide = bgr.copy()
-    for _ in range(profile.bilateral_passes):
-        guide = cv2.bilateralFilter(
-            guide, profile.bilateral_d,
-            profile.bilateral_sigma_color, profile.bilateral_sigma_space,
-        )
-    inpainted = cv2.inpaint(guide, flaw_mask, profile.flaw_inpaint_radius, cv2.INPAINT_NS)
-    fm = (flaw_mask > 0).astype(np.float32)
+    repaired = _fft_lp_bgr(bgr.astype(np.float64), _flaw_repair_sigma(profile))
+    fm = cv2.GaussianBlur(flaw_mask.astype(np.float32), (5, 5), 0) / 255.0
     fm3 = np.stack([fm, fm, fm], axis=2)
-    return clip_to_uint8(bgr.astype(np.float32) * (1.0 - fm3) + inpainted.astype(np.float32) * fm3)
+    return clip_to_uint8(bgr.astype(np.float64) * (1.0 - fm3) + repaired * fm3)
 
 
 def build_forehead_mask(shape: Tuple[int, int], geom: FaceGeometry | None = None) -> np.ndarray:
@@ -1171,6 +1166,20 @@ def _fft_lp(channel: np.ndarray, sigma: float) -> np.ndarray:
         channel.astype(np.float64),
         make_gaussian_kernel(pad, sigma),
     )
+
+
+def _fft_lp_bgr(bgr: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian LPF each BGR channel in the frequency domain."""
+    out = np.empty_like(bgr, dtype=np.float64)
+    for c in range(3):
+        out[:, :, c] = _fft_lp(bgr[:, :, c], sigma)
+    return out
+
+
+def _flaw_repair_sigma(profile: BeautyProfile) -> float:
+    """LPF sigma for blemish fill — stronger than cosmetic skin smooth."""
+    scale = 2.0 if is_red_blemish(profile) else 1.75
+    return max(profile.fft_sigma * scale, 12.0)
 
 
 def _fft_local_skin_field(channel: np.ndarray, sigma_fine: float, sigma_coarse: float) -> np.ndarray:
