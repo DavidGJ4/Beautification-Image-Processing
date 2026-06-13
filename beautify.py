@@ -1,13 +1,9 @@
-﻿"""
-Homework 2: Facial Image Beautification Using Frequency-Domain Techniques
-==========================================================================
-Universal flaw_reduction pipeline: auto face analysis, adaptive masks, FFT +
-bilateral smoothing. Modes: red_blemish (spots) | line_flaw (wrinkles/lines).
-"""
+"""Frequency-domain facial beautification (HW2)."""
 
 from __future__ import annotations
 
 import os
+import urllib.request
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Dict, List, Tuple
@@ -22,16 +18,25 @@ import numpy as np
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMG_DIR = os.path.join(BASE_DIR, "images")
 OUT_DIR = os.path.join(BASE_DIR, "output")
-FACE_MODEL = os.path.join(
-    BASE_DIR, "face-smoothing-ref", "face-smoothing-main", "models", "opencv_face_detector_uint8.pb"
-)
-FACE_CONFIG = os.path.join(
-    BASE_DIR, "face-smoothing-ref", "face-smoothing-main", "models", "opencv_face_detector.pbtxt"
-)
-os.makedirs(IMG_DIR, exist_ok=True)
-os.makedirs(OUT_DIR, exist_ok=True)
+
+# Model files live in a local "models/" folder next to this script.
+# They are downloaded automatically on first run if missing.
+MODEL_DIR  = os.path.join(BASE_DIR, "models")
+FACE_MODEL = os.path.join(MODEL_DIR, "opencv_face_detector_uint8.pb")
+FACE_CONFIG = os.path.join(MODEL_DIR, "opencv_face_detector.pbtxt")
+
+os.makedirs(IMG_DIR,   exist_ok=True)
+os.makedirs(OUT_DIR,   exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 MAX_IMAGE_SIZE = 768
+
+# portrait config — edit stems when you rename images
+PORTRAIT_JOBS = [
+    {"stem": "WOMAN1", "pipeline": "acne"},
+    {"stem": "WOMAN", "pipeline": "porcelain"},
+]
+
 FACE_CONF = 0.55
 
 
@@ -40,9 +45,7 @@ HSV_SKIN_LOW = np.array([0, 80, 80], dtype=np.uint8)
 HSV_SKIN_HIGH = np.array([200, 255, 255], dtype=np.uint8)
 
 
-# ─────────────────────────────────────────────────────────────
-# Profiles — bilateral params from face-smoothing-main + FFT for assignment
-# ─────────────────────────────────────────────────────────────
+# profiles
 def is_red_blemish(profile: BeautyProfile) -> bool:
     return profile.flaw_mode == "red_blemish"
 
@@ -156,9 +159,7 @@ class FaceAnalysis:
     annotate_bgr: Tuple[int, int, int] = (0, 255, 255)
 
 
-# ─────────────────────────────────────────────────────────────
-# Image I/O
-# ─────────────────────────────────────────────────────────────
+# image i/o
 def load_portrait(path: str, max_size: int = MAX_IMAGE_SIZE) -> np.ndarray | None:
     img = cv2.imread(path)
     if img is None:
@@ -186,9 +187,7 @@ def get_all_portraits() -> list[Tuple[str, np.ndarray]]:
     return pairs
 
 
-# ─────────────────────────────────────────────────────────────
-# Kernel cache (face-smoothing uses repeated filter ops per ROI)
-# ─────────────────────────────────────────────────────────────
+# kernel cache
 @lru_cache(maxsize=64)
 def _cached_gaussian(shape: Tuple[int, int], sigma: float) -> np.ndarray:
     rows, cols = shape
@@ -256,18 +255,59 @@ def apply_frequency_filter(channel: np.ndarray, kernel: np.ndarray) -> np.ndarra
     return np.fft.ifft2(np.fft.ifftshift(spectrum * kernel)).real[:m, :n]
 
 
-# ─────────────────────────────────────────────────────────────
-# face-smoothing-main core — DNN face ROI + HSV mask + bilateral
-# ─────────────────────────────────────────────────────────────
+# face detection and skin mask
+_DNN_URLS = {
+    FACE_MODEL: (
+        "https://raw.githubusercontent.com/spmallick/learnopencv/master/"
+        "FaceDetectionComparison/models/opencv_face_detector_uint8.pb"
+    ),
+    FACE_CONFIG: (
+        "https://raw.githubusercontent.com/spmallick/learnopencv/master/"
+        "FaceDetectionComparison/models/opencv_face_detector.pbtxt"
+    ),
+}
+
+
+def _ensure_dnn_weights() -> bool:
+    """
+    Download the OpenCV DNN face-detector weights if they are missing.
+    Returns True if both files are present (either pre-existing or just downloaded).
+    """
+    all_present = True
+    for dest, url in _DNN_URLS.items():
+        if os.path.isfile(dest):
+            continue
+        print(f"[*] Downloading face-detector model: {os.path.basename(dest)} ...")
+        try:
+            urllib.request.urlretrieve(url, dest)
+            print(f"[+] Saved to: {dest}")
+        except Exception as exc:
+            print(f"[-] Download failed ({exc}). Will use spatial fallback for face detection.")
+            all_present = False
+    return all_present
+
+
 @lru_cache(maxsize=1)
-def _face_detector() -> cv2.dnn.Net:
-    return cv2.dnn.readNetFromTensorflow(FACE_MODEL, FACE_CONFIG)
+def _face_detector() -> cv2.dnn.Net | None:
+    """Load the DNN model; return None if files are unavailable."""
+    if not (os.path.isfile(FACE_MODEL) and os.path.isfile(FACE_CONFIG)):
+        return None
+    try:
+        return cv2.dnn.readNetFromTensorflow(FACE_MODEL, FACE_CONFIG)
+    except Exception as exc:
+        print(f"[-] Could not load DNN face detector: {exc}")
+        return None
 
 
 def detect_face_bboxes(bgr: np.ndarray) -> list[list[int]]:
-    """OpenCV DNN face detector (same model as face-smoothing-main)."""
-    h, w = bgr.shape[:2]
+    """
+    OpenCV DNN face detector. Returns [] (triggering spatial fallback)
+    if the model files are missing or fail to load — no crash.
+    """
     net = _face_detector()
+    if net is None:
+        return []
+    h, w = bgr.shape[:2]
     blob = cv2.dnn.blobFromImage(bgr, 1.0, (200, 200), (104, 117, 123), False, False)
     net.setInput(blob)
     detections = net.forward()
@@ -283,10 +323,15 @@ def detect_face_bboxes(bgr: np.ndarray) -> list[list[int]]:
 
 
 def _fallback_face_bbox(shape: Tuple[int, int]) -> list[int]:
+    """Friend-style spatial fallback when DNN model is unavailable."""
     h, w = shape
-    cx, cy = w // 2, int(h * 0.46)
-    bw, bh = int(w * 0.52), int(h * 0.62)
-    return [cx - bw // 2, cy - bh // 2, cx + bw // 2, cy + bh // 2]
+    cx, cy = int(w * 0.465), int(h * 0.44)
+    bw, bh = int(w * 0.35), int(h * 0.58)
+    x1 = max(0, cx - bw // 2)
+    y1 = max(0, cy - bh // 2)
+    x2 = min(w, cx + bw // 2)
+    y2 = min(h, cy + bh // 2)
+    return [x1, y1, x2, y2]
 
 
 def _expand_bbox(bbox: list[int], shape: Tuple[int, int], pad_frac: float = 0.10) -> list[int]:
@@ -660,7 +705,7 @@ def _mask_to_boxes(mask: np.ndarray, min_area: int = 20, pad: int = 4) -> List[T
 def collect_enhancement_boxes(analysis: FaceAnalysis) -> Tuple[List[Tuple[int, int, int, int]], Tuple[int, int, int]]:
     """Regions that will be enhanced — yellow (acne) or green (wrinkles/moles)."""
     if is_red_blemish(analysis.profile):
-        boxes = _mask_to_boxes(analysis.flaw_mask, min_area=10, pad=5)
+        boxes = _mask_to_boxes(analysis.flaw_mask, min_area=3, pad=5)
         return boxes, (0, 255, 255)
 
     boxes: List[Tuple[int, int, int, int]] = []
@@ -678,7 +723,11 @@ def collect_enhancement_boxes(analysis: FaceAnalysis) -> Tuple[List[Tuple[int, i
     return boxes, (0, 255, 0)
 
 
-def render_before_preview(bgr: np.ndarray, analysis: FaceAnalysis) -> np.ndarray:
+def render_before_preview(
+    bgr: np.ndarray,
+    analysis: FaceAnalysis,
+    show_face_outline: bool = False,
+) -> np.ndarray:
     """Before image: original with neon boxes on detected enhancement targets."""
     img = bgr.copy()
     color = analysis.annotate_bgr
@@ -688,6 +737,14 @@ def render_before_preview(bgr: np.ndarray, analysis: FaceAnalysis) -> np.ndarray
             cv2.rectangle(img, (x - t, y - t), (x2 + t, y2 + t), color, t)
     x1, y1, x2, y2 = analysis.geom.bbox
     cv2.rectangle(img, (x1, y1), (x2, y2), (180, 180, 180), 1)
+    if show_face_outline:
+        shape = bgr.shape[:2]
+        face_mask = _blend_skin_mask_u8(analysis.geom, analysis.skin_mask, shape)
+        contours, _ = cv2.findContours(face_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(img, contours, -1, (0, 255, 255), 2)
+        bbox_oval = _face_bbox_oval_u8(analysis.geom, shape)
+        bbox_contours, _ = cv2.findContours(bbox_oval, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(img, bbox_contours, -1, (255, 180, 0), 1)
     return img
 
 
@@ -737,7 +794,7 @@ def apply_gradient_acne_tone(bgr: np.ndarray, analysis: FaceAnalysis) -> np.ndar
 def analyze_portrait(bgr: np.ndarray, name_hint: str = "") -> FaceAnalysis:
     """Analyze any portrait: face geometry, skin mask, profile, flaw/wrinkle maps."""
     bboxes = detect_face_bboxes(bgr) or [_fallback_face_bbox(bgr.shape[:2])]
-    geom = FaceGeometry.from_bbox(_expand_bbox(bboxes[0], bgr.shape[:2]))
+    geom = FaceGeometry.from_bbox(_expand_bbox(bboxes[0], bgr.shape[:2], pad_frac=0.12))
     skin_mask = build_skin_mask(bgr, geom)
     profile = infer_profile_from_image(bgr, skin_mask, name_hint)
     flaw_mask = detect_skin_flaws(bgr, skin_mask, profile, geom)
@@ -755,9 +812,7 @@ def analyze_portrait(bgr: np.ndarray, name_hint: str = "") -> FaceAnalysis:
     return analysis
 
 
-# ─────────────────────────────────────────────────────────────
-# Pipelines
-# ─────────────────────────────────────────────────────────────
+# pipelines
 def enhance_before(analysis: FaceAnalysis) -> dict:
     """Before = flaw/wrinkle preview with neon target boxes."""
     bgr = analysis.bgr
@@ -830,8 +885,10 @@ def compute_magnitude_spectrum(bgr: np.ndarray) -> np.ndarray:
     return (mag / mag.max() * 255).astype(np.uint8)
 
 
+
+
+# visualisation
 def radial_profile_vectorized(mag: np.ndarray) -> np.ndarray:
-    """Vectorised radial mean — O(HW) via bincount."""
     h, w = mag.shape
     cy, cx = h // 2, w // 2
     yy, xx = np.indices((h, w))
@@ -843,9 +900,6 @@ def radial_profile_vectorized(mag: np.ndarray) -> np.ndarray:
     return sums / np.maximum(counts, 1)
 
 
-# ─────────────────────────────────────────────────────────────
-# Visualisation
-# ─────────────────────────────────────────────────────────────
 def bgr_to_rgb(img: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
@@ -908,51 +962,43 @@ def save_triptych_figure(
 
 
 def save_professor_figure(name, original, after_d, out_dir):
-    """
-    Side-by-side deliverable with FFT equation overlay on spectrum panel.
-    """
     prof = after_d["profile"]
     fig = plt.figure(figsize=(16, 9))
     fig.patch.set_facecolor("#0f0f14")
-    gs = gridspec.GridSpec(2, 3, figure=fig, height_ratios=[1.2, 1],
-                           hspace=0.28, wspace=0.18, left=0.04, right=0.96, top=0.88, bottom=0.06)
-
+    gs = gridspec.GridSpec(2, 3, figure=fig, height_ratios=[1.2, 1], hspace=0.28, wspace=0.18,
+                           left=0.04, right=0.96, top=0.88, bottom=0.06)
     ax0 = fig.add_subplot(gs[0, 0])
     ax0.imshow(bgr_to_rgb(original))
     ax0.set_title("Original f(x,y)", color="white", fontsize=11, fontweight="bold")
     ax0.axis("off")
-
     ax1 = fig.add_subplot(gs[0, 1])
     ax1.imshow(bgr_to_rgb(after_d["image"]))
     ax1.set_title(f"Beautified g(x,y) — {prof.name}", color="#33dd88", fontsize=11, fontweight="bold")
     ax1.axis("off")
-
     ax2 = fig.add_subplot(gs[0, 2])
     diff = np.clip(np.abs(original.astype(np.int16) - after_d["image"].astype(np.int16)) * 3, 0, 255)
     ax2.imshow(bgr_to_rgb(diff.astype(np.uint8)))
     ax2.set_title("Change map (×3)", color="white", fontsize=11, fontweight="bold")
     ax2.axis("off")
-
     gray_o = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY).astype(np.float64)
     gray_a = cv2.cvtColor(after_d["image"], cv2.COLOR_BGR2GRAY).astype(np.float64)
     spec_o = compute_magnitude_spectrum(original)
     spec_a = compute_magnitude_spectrum(after_d["image"])
-
     ax3 = fig.add_subplot(gs[1, 0])
     ax3.imshow(spec_o, cmap="inferno")
     ax3.set_title("Original spectrum", color="white", fontsize=10)
     ax3.axis("off")
-
     ax4 = fig.add_subplot(gs[1, 1])
     ax4.imshow(spec_a, cmap="inferno")
     ax4.set_title("Filtered spectrum", color="white", fontsize=10)
     ax4.axis("off")
-    ax4.text(0.5, -0.12,
-             r"$F(u,v)=\mathrm{FFT}\{f(x,y)\}$" + "\n"
-             r"$G(u,v)=H_{\mathrm{LP,BP,HP}}\!\cdot\!F$" + "\n"
-             r"$g(x,y)=\mathrm{real}\{\mathrm{IFFT}\{G\}\}$",
-             transform=ax4.transAxes, ha="center", color="#aaaacc", fontsize=10)
-
+    ax4.text(
+        0.5, -0.12,
+        r"$F(u,v)=\mathrm{FFT}\{f(x,y)\}$" + "\n"
+        r"$G(u,v)=H_{\mathrm{LP,BP,HP}}\!\cdot\!F$" + "\n"
+        r"$g(x,y)=\mathrm{real}\{\mathrm{IFFT}\{G\}\}$",
+        transform=ax4.transAxes, ha="center", color="#aaaacc", fontsize=10,
+    )
     ax5 = fig.add_subplot(gs[1, 2])
     ax5.set_facecolor("#1a1a28")
     p_o = radial_profile_vectorized(np.abs(np.fft.fftshift(np.fft.fft2(gray_o))))
@@ -963,9 +1009,10 @@ def save_professor_figure(name, original, after_d, out_dir):
     ax5.set_title("Radial energy (high-freq → right)", color="white", fontsize=10)
     ax5.legend(facecolor="#1a1a28", labelcolor="white", fontsize=8)
     ax5.tick_params(colors="gray")
-
-    fig.suptitle(f"HW2 Frequency-Domain Facial Beautification — {name}",
-                 color="white", fontsize=13, fontweight="bold", y=0.96)
+    fig.suptitle(
+        f"HW2 Frequency-Domain Facial Beautification — {name}",
+        color="white", fontsize=13, fontweight="bold", y=0.96,
+    )
     path = os.path.join(out_dir, f"{name}_professor.png")
     fig.savefig(path, dpi=140, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -1031,11 +1078,13 @@ def save_pipeline_figure(name, original, after_d, out_dir):
 def save_hist_figure(name, original, before_img, after_img, out_dir):
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     fig.patch.set_facecolor("#0f0f14")
-    for ax, img, title, col in zip(axes, [original, before_img, after_img],
-                                    ["Original", "Before", "After"],
-                                    ["#5588ff", "#ffaa33", "#33dd88"]):
-        ax.hist(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).ravel(), bins=256,
-                range=(0, 255), color=col, alpha=0.8)
+    for ax, img, title, col in zip(
+        axes,
+        [original, before_img, after_img],
+        ["Original", "Before", "After"],
+        ["#5588ff", "#ffaa33", "#33dd88"],
+    ):
+        ax.hist(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).ravel(), bins=256, range=(0, 255), color=col, alpha=0.8)
         ax.set_title(title, color="white")
         ax.set_facecolor("#1a1a28")
         ax.tick_params(colors="gray")
@@ -1045,99 +1094,14 @@ def save_hist_figure(name, original, before_img, after_img, out_dir):
     return path
 
 
-def _face_skin_region(skin_mask: np.ndarray, chin_frac: float = 0.96) -> np.ndarray:
-    """Skin pixels above the neck (tiny trim only — used for offset / chin anchor)."""
-    skin = skin_mask > 128
-    ys, xs = np.where(skin)
-    if len(xs) < 50:
-        return skin
-    y_top = int(ys.min())
-    y_chin = y_top + int((int(ys.max()) - y_top) * chin_frac)
-    return skin & (np.arange(skin_mask.shape[0], dtype=np.int32)[:, None] <= y_chin)
-
-
-def _skin_norm_offset(geom: FaceGeometry, skin_mask: np.ndarray) -> Tuple[float, float]:
-    """Skin centroid minus DNN bbox center, in normalized face units."""
-    ys, xs = np.where(skin_mask > 128)
-    if len(xs) < 50:
-        return 0.0, 0.0
-    return (
-        (float(xs.mean()) - geom.cx) / max(geom.fw, 1),
-        (float(ys.mean()) - geom.cy) / max(geom.fh, 1),
-    )
-
-
-def _soft_jaw_taper_f(
-    shape: Tuple[int, int],
-    geom: FaceGeometry,
-    skin_mask: np.ndarray,
-    cx: int,
-    chin_y: int,
-) -> np.ndarray:
-    """Soft triangular jaw: wide at cheek level, tapering to a rounded chin point."""
-    h, w = shape
-    dnx, dny = _skin_norm_offset(geom, skin_mask)
-    left = geom.point(0.22 + dnx, 0.80 + dny)
-    right = geom.point(0.78 + dnx, 0.80 + dny)
-    chin = geom.point(0.50 + dnx, 0.90 + dny)
-    chin_y = min(chin_y, int(chin[1]))
-    taper_y0 = int(geom.point(0.50 + dnx, 0.68 + dny)[1])
-
-    tri = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillConvexPoly(tri, np.array([left, right, chin], dtype=np.int32), 255)
-    tri_f = cv2.GaussianBlur(tri.astype(np.float32), (27, 27), 0) / 255.0
-
-    yy = np.arange(h, dtype=np.float32)[:, None]
-    jaw_hw = max(int(geom.fw * 0.44), int(abs(right[0] - left[0]) // 2), 1)
-    t = np.clip((yy - taper_y0) / max(chin_y - taper_y0, 1), 0.0, 1.0)
-    half_w = jaw_hw * (1.0 - 0.90 * t)
-    xx = np.arange(w, dtype=np.float32)[None, :]
-    trap = (np.abs(xx - cx) <= half_w).astype(np.float32)
-    trap = np.maximum(trap, (yy <= taper_y0).astype(np.float32))
-    trap *= (yy <= chin_y + 3).astype(np.float32)
-    trap = cv2.GaussianBlur(trap, (21, 21), 0)
-    return np.clip(np.maximum(tri_f, trap), 0.0, 1.0)
-
-
-def _skin_face_oval_u8(
-    shape: Tuple[int, int], geom: FaceGeometry, skin_mask: np.ndarray,
-) -> np.ndarray:
-    """Full face oval (original size) with a soft triangular jaw instead of a round neck spill."""
-    h, w = shape
-    skin = skin_mask > 128
-    ys, xs = np.where(skin)
-    dnx, dny = _skin_norm_offset(geom, skin_mask)
-    if len(xs) >= 50:
-        cx = int(xs.mean())
-        cy = int(ys.mean())
-        x_span = int(xs.max() - xs.min())
-        y_span = int(ys.max() - ys.min())
-        rx = max(int(x_span * 0.56), int(geom.fw * 0.50), 1)
-        ry = max(int(y_span * 0.56), int(geom.fh * 0.54), 1)
-        chin_y = int(geom.point(0.50 + dnx, 0.90 + dny)[1])
-    else:
-        cx, cy = geom.cx, geom.cy
-        rx = max(1, int(geom.fw * 0.50))
-        ry = max(1, int(geom.fh * 0.54))
-        chin_y = int(geom.point(0.50 + dnx, 0.90 + dny)[1])
-
-    oval = np.zeros((h, w), dtype=np.uint8)
-    cv2.ellipse(oval, (cx, cy), (rx, ry), 0, 0, 360, 255, -1)
-    jaw = _soft_jaw_taper_f(shape, geom, skin_mask, cx, chin_y)
-    combined = (oval.astype(np.float32) / 255.0) * jaw
-    return np.clip(combined * 255.0, 0, 255).astype(np.uint8)
-
-
 def _heatmap_face_mask(
     shape: Tuple[int, int], geom: FaceGeometry, skin_mask: np.ndarray,
 ) -> np.ndarray:
-    """Feathered skin-aligned oval — same region as WOMAN beautification blend."""
     oval = _skin_face_oval_u8(shape, geom, skin_mask)
     return cv2.GaussianBlur(oval.astype(np.float32), (31, 31), 0) / 255.0
 
 
 def _mask_diff_to_face(diff_bgr: np.ndarray, face_m: np.ndarray) -> np.ndarray:
-    """Restrict diff to feathered face oval; dilate so cheeks/forehead are covered."""
     gray = (
         cv2.cvtColor(diff_bgr, cv2.COLOR_BGR2GRAY)
         if diff_bgr.ndim == 3 else diff_bgr.copy()
@@ -1152,12 +1116,10 @@ def save_difference_map(name, original, before_img, after_img, out_dir, analysis
         return np.clip(np.abs(a.astype(np.int16) - b.astype(np.int16)) * 4, 0, 255).astype(np.uint8)
 
     d_b, d_a = diff(original, before_img), diff(original, after_img)
-
     if analysis is not None:
         face_m = _heatmap_face_mask(original.shape[:2], analysis.geom, analysis.skin_mask)
         d_b = _mask_diff_to_face(d_b, face_m)
         d_a = _mask_diff_to_face(d_a, face_m)
-
     fig, axes = plt.subplots(2, 4, figsize=(18, 9))
     fig.patch.set_facecolor("#0f0f14")
     for row, col, data, title, cmap in [
@@ -1187,9 +1149,11 @@ def save_spectrum_figure(name, original, before_img, after_img, out_dir):
     for img in [original, before_img, after_img]:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64)
         mag = np.abs(np.fft.fftshift(np.fft.fft2(gray)))
-        specs.append((np.log1p(mag) / np.log1p(mag).max() * 255).astype(np.uint8))
+        specs.append(
+            (np.log1p(mag) / np.log1p(mag).max() * 255).astype(np.uint8)
+            if np.log1p(mag).max() > 0 else np.zeros(gray.shape, dtype=np.uint8)
+        )
         profiles.append(radial_profile_vectorized(mag))
-
     fig = plt.figure(figsize=(18, 10))
     fig.patch.set_facecolor("#0f0f14")
     gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.3,
@@ -1199,12 +1163,10 @@ def save_spectrum_figure(name, original, before_img, after_img, out_dir):
         ax.imshow(spec, cmap="inferno")
         ax.set_title(f"Spectrum: {title}", color="white", fontsize=10, fontweight="bold")
         ax.axis("off")
-
     ax = fig.add_subplot(gs[1, :])
     ax.set_facecolor("#1a1a28")
     x = np.arange(len(profiles[0]))
-    for p, c, lbl in zip(profiles, ["#5588ff", "#ffaa33", "#33dd88"],
-                         ["Original", "Before", "After"]):
+    for p, c, lbl in zip(profiles, ["#5588ff", "#ffaa33", "#33dd88"], ["Original", "Before", "After"]):
         ax.plot(x, p, color=c, lw=1.5, label=lbl)
     ax.set_title("Radial frequency energy (vectorised)", color="white", fontsize=10)
     ax.legend(facecolor="#1a1a28", labelcolor="white")
@@ -1221,8 +1183,7 @@ def save_rgb_channel_figure(name, original, before_img, after_img, out_dir):
     fig.patch.set_facecolor("#0f0f14")
     gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.45, wspace=0.25,
                            left=0.05, right=0.97, top=0.93, bottom=0.05)
-    for col, (img, ct) in enumerate(zip([original, before_img, after_img],
-                                         ["Original", "Before", "After"])):
+    for col, (img, ct) in enumerate(zip([original, before_img, after_img], ["Original", "Before", "After"])):
         for row, ci in enumerate(range(3)):
             ax = fig.add_subplot(gs[row, col])
             ax.imshow(img[:, :, ci], cmap="gray", vmin=0, vmax=255)
@@ -1242,9 +1203,7 @@ def save_rgb_channel_figure(name, original, before_img, after_img, out_dir):
     return path
 
 
-# ─────────────────────────────────────────────────────────────
-# Metrics + report
-# ─────────────────────────────────────────────────────────────
+# metrics
 def psnr(img_a, img_b):
     mse = np.mean((img_a.astype(np.float64) - img_b.astype(np.float64)) ** 2)
     return float("inf") if mse == 0 else 10 * np.log10(255 ** 2 / mse)
@@ -1265,81 +1224,7 @@ def compute_metrics(original, enhanced):
     }
 
 
-def build_report(face_data: list, out_dir: str) -> str:
-    from reportlab.lib import colors
-    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.lib.units import cm
-    from reportlab.platypus import (
-        HRFlowable, Image as RLImage, PageBreak, Paragraph,
-        SimpleDocTemplate, Spacer, Table, TableStyle,
-    )
-
-    pdf_path = os.path.join(out_dir, "report.pdf")
-    doc = SimpleDocTemplate(pdf_path, pagesize=A4,
-                            leftMargin=2 * cm, rightMargin=2 * cm,
-                            topMargin=2 * cm, bottomMargin=2 * cm)
-    styles = getSampleStyleSheet()
-    avail_w = A4[0] - 4 * cm
-    title_style = ParagraphStyle("T", parent=styles["Title"], fontSize=18,
-                                 textColor=colors.HexColor("#1a237e"))
-    h1 = ParagraphStyle("H1", parent=styles["Heading1"], fontSize=14,
-                        textColor=colors.HexColor("#283593"), spaceBefore=10)
-    body = ParagraphStyle("B", parent=styles["BodyText"], fontSize=10,
-                          leading=15, alignment=TA_JUSTIFY)
-    code = ParagraphStyle("C", fontName="Courier", fontSize=8.5, leftIndent=1 * cm)
-    caption_style = ParagraphStyle("Cap", parent=styles["Italic"], fontSize=9, alignment=TA_CENTER)
-
-    def img_block(path, caption=None):
-        out = [RLImage(path, width=avail_w, height=avail_w * 0.56)]
-        if caption:
-            out.append(Paragraph(caption, caption_style))
-        return out
-
-    story = [
-        Spacer(1, 1 * cm),
-        Paragraph("Homework 2: Frequency-Domain Facial Beautification", title_style),
-        HRFlowable(width=avail_w, thickness=2, color=colors.HexColor("#3949ab")),
-        Paragraph(
-            "Pipeline: universal flaw_reduction — auto face analysis, neon-box before preview, "
-            "adaptive line-flaw smoothing (bbox-relative), gradient LAB fix for red blemishes.",
-            body),
-        Paragraph("F(u,v)=FFT{f}; G=H·F; g=real{IFFT{G}}", code),
-    ]
-
-    for i, fd in enumerate(face_data):
-        story.append(Paragraph(f"Results — {fd['name']} ({fd['profile_name']})", h1))
-        for key, cap in [
-            ("fig_professor", "Professor summary: original vs beautified, FFT equation, radial energy."),
-            ("fig_comparison", "Full comparison with adaptive weight map."),
-            ("fig_pipeline", "Pipeline steps and masks."),
-            ("fig_filters", "Filter kernels H(u,v)."),
-            ("fig_spec", "FFT spectra and vectorised radial profile."),
-            ("fig_hist", "Histograms."),
-            ("fig_diff", "Difference maps."),
-            ("fig_rgb", "RGB channel analysis."),
-        ]:
-            story += img_block(fd[key], cap)
-            story.append(Spacer(1, 0.15 * cm))
-        mb, ma = fd["metrics_before"], fd["metrics_after"]
-        mt = Table([
-            ["Metric", "Before", "After"],
-            ["PSNR", f"{mb['PSNR']:.2f}", f"{ma['PSNR']:.2f}"],
-            ["SSIM", f"{mb['SSIM']:.4f}", f"{ma['SSIM']:.4f}"],
-            ["Std-dev", f"{mb['StdDev_enh']:.2f}", f"{ma['StdDev_enh']:.2f}"],
-        ], colWidths=[5 * cm, 5 * cm, 5 * cm])
-        mt.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8eaf6"))]))
-        story.append(mt)
-        if i < len(face_data) - 1:
-            story.append(PageBreak())
-    doc.build(story)
-    return pdf_path
-
-
-
-# ── FFT helpers & masks (disassembly lines 1234–1551) ─────────────────────────
+# fft helpers
 
 def _soft_mask(mask_u8: np.ndarray, ksize: int) -> np.ndarray:
     return cv2.GaussianBlur(
@@ -1372,11 +1257,11 @@ def _exclude_features(mask: np.ndarray, geom: FaceGeometry, shape: Tuple[int, in
     return out
 
 
-def _exclude_features_woman1(mask: np.ndarray, geom: FaceGeometry, shape: Tuple[int, int]) -> np.ndarray:
+def _exclude_acne_zones(mask: np.ndarray, geom: FaceGeometry, shape: Tuple[int, int]) -> np.ndarray:
     out = _exclude_features(mask, geom, shape)
+    # mouth/chin only — keep nose-flank cheeks (0.40/0.60) for pimples beside nose
     for nx, ny, rx, ry in (
         (0.50, 0.66, 0.30, 0.11), (0.50, 0.76, 0.22, 0.10),
-        (0.40, 0.63, 0.14, 0.09), (0.60, 0.63, 0.14, 0.09),
     ):
         zone = geom.ellipse_mask(shape, nx, ny, rx, ry)
         out = cv2.bitwise_and(out, cv2.bitwise_not(zone))
@@ -1424,49 +1309,43 @@ def _load_image(path: str, max_size: int = MAX_IMAGE_SIZE) -> np.ndarray:
     return img
 
 
-# ── WOMAN1 acne restoration ─────────────────────────────────────────────────
+# acne pipeline
 
-def _woman1_acne_mask(
+def _acne_target_mask(
     bgr: np.ndarray, skin_mask: np.ndarray, geom: FaceGeometry, shape: Tuple[int, int],
 ) -> np.ndarray:
+    """Friend-style acne mask — softer HSV + dark spots, catches more pimples."""
     skin = skin_mask > 0
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     a_ch = lab[:, :, 1].astype(np.float32)
     l_ch = lab[:, :, 0].astype(np.float32)
     local_a = cv2.GaussianBlur(a_ch, (41, 41), 0)
-    lap = np.abs(cv2.Laplacian(l_ch, cv2.CV_32F))
-    texture = cv2.GaussianBlur(lap, (7, 7), 0)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     red_hsv = cv2.bitwise_or(
-        cv2.inRange(hsv, np.array([0, 58, 58]), np.array([11, 255, 255])),
-        cv2.inRange(hsv, np.array([169, 58, 58]), np.array([180, 255, 255])),
+        cv2.inRange(hsv, np.array([0, 35, 35]), np.array([16, 255, 255])),
+        cv2.inRange(hsv, np.array([160, 35, 35]), np.array([180, 255, 255])),
     )
-    red_blemish = (
-        (a_ch > local_a + 3.5) & (red_hsv > 0) & (texture > 2.0) & skin
+    red_blemish = ((a_ch > local_a + 2.2) & (red_hsv > 0) & skin)
+    dark_spot = ((l_ch < cv2.GaussianBlur(l_ch, (31, 31), 0) - 8.0) & skin)
+    raw = cv2.bitwise_or(
+        red_blemish.astype(np.uint8) * 255,
+        dark_spot.astype(np.uint8) * 255,
     )
-    raw = red_blemish.astype(np.uint8) * 255
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, k, iterations=1)
     raw = cv2.dilate(raw, k, iterations=1)
     raw = cv2.bitwise_and(raw, skin_mask)
     h, w = shape
-    max_area = max(60, int(h * w * 0.0025))
+    max_area = max(120, int(h * w * 0.005))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(raw, connectivity=8)
     out = np.zeros_like(raw)
     for i in range(1, n):
-        area = stats[i, cv2.CC_STAT_AREA]
-        bw = stats[i, cv2.CC_STAT_WIDTH]
-        bh = stats[i, cv2.CC_STAT_HEIGHT]
-        compact = min(bw, bh) / max(bw, bh, 1)
-        if not (8 <= area <= max_area):
-            continue
-        if compact < 0.25:
-            continue
-        out[labels == i] = 255
-    return _exclude_features_woman1(out, geom, shape)
+        if 3 <= stats[i, cv2.CC_STAT_AREA] <= max_area:
+            out[labels == i] = 255
+    return _exclude_acne_zones(out, geom, shape)
 
 
-def _woman1_safe_skin_mask(analysis: FaceAnalysis, shape: Tuple[int, int]) -> np.ndarray:
+def _safe_skin_mask_acne(analysis: FaceAnalysis, shape: Tuple[int, int]) -> np.ndarray:
     x1, y1, x2, y2 = analysis.geom.bbox
     face_skin = np.zeros(shape, dtype=np.uint8)
     face_skin[y1:y2, x1:x2] = analysis.skin_mask[y1:y2, x1:x2]
@@ -1475,7 +1354,7 @@ def _woman1_safe_skin_mask(analysis: FaceAnalysis, shape: Tuple[int, int]) -> np
     return skin_f * (1.0 - _soft_mask(mouth_zone, 21))
 
 
-def restore_woman1_before(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.ndarray, float]:
+def restore_before_acne(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.ndarray, float]:
     skin_mask = analysis.skin_mask
     skin_f = _soft_mask(skin_mask, 27)
     skin_px = skin_mask > 0
@@ -1507,9 +1386,9 @@ def restore_woman1_before(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.n
     return result, sigma_lp
 
 
-def beautify_woman1_fft(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.ndarray, float]:
+def beautify_acne_fft(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.ndarray, float]:
     shape = bgr.shape[:2]
-    safe_skin = _woman1_safe_skin_mask(analysis, shape)
+    safe_skin = _safe_skin_mask_acne(analysis, shape)
     skin_pixels = analysis.skin_mask > 0
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float64)
     L, a, b = lab[:, :, 0], lab[:, :, 1], lab[:, :, 2]
@@ -1523,21 +1402,22 @@ def beautify_woman1_fft(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.nda
         L_ref[~skin_pixels] = med_l
     a_tone = _fft_local_skin_field(a_ref, 9.0, 24.0)
     b_tone = _fft_local_skin_field(b_ref, 9.0, 26.0)
-    L_tone = _fft_local_skin_field(L_ref, 9.0, 28.0)
     a_local = _fft_local_skin_field(a, 8.0, 18.0)
     red_map = np.clip((a - a_local - 0.4) / 6.5, 0.0, 1.0) * safe_skin
-    chroma_w = np.clip(red_map * 0.88, 0.0, 0.88)
+    flaw_weight = (analysis.flaw_mask.astype(np.float64) / 255.0) * safe_skin
+    treat_w = np.clip(np.maximum(red_map, flaw_weight * 0.85), 0.0, 1.0)
+    chroma_w = np.clip(treat_w * 0.92, 0.0, 0.92)
     a_out = a * (1.0 - chroma_w) + a_tone * chroma_w
     b_out = b * (1.0 - chroma_w * 0.38) + b_tone * (chroma_w * 0.38)
     pad = _padded_shape(a.shape)
     a_lp = apply_frequency_filter(a_out, make_gaussian_kernel(pad, 16.0))
     b_lp = apply_frequency_filter(b_out, make_gaussian_kernel(pad, 18.0))
-    lp_w = np.clip(red_map * 0.35, 0.0, 0.35) * safe_skin
+    lp_w = np.clip(treat_w * 0.35, 0.0, 0.35) * safe_skin
     a_out = a_out * (1.0 - lp_w) + a_lp * lp_w
     b_out = b_out * (1.0 - lp_w * 0.5) + b_lp * (lp_w * 0.5)
-    L_lift = np.clip(red_map * 0.38, 0.0, 0.38)
-    L_clear = np.maximum(L_tone, L)
-    L_out = L * (1.0 - L_lift) + L_clear * L_lift
+    combined_lift = np.clip(red_map * 0.55 + flaw_weight * 0.45, 0.0, 1.0)
+    L_healthy = _fft_local_skin_field(L, 16.0, 45.0)
+    L_out = L * (1.0 - combined_lift) + np.maximum(L_healthy + 2.0, L) * combined_lift
     L_smooth = _fft_local_skin_field(L_out, 10.0, 30.0)
     smooth_w = np.clip(safe_skin * 0.26, 0.0, 0.26)
     L_out = L_out * (1.0 - smooth_w) + L_smooth * smooth_w
@@ -1564,31 +1444,109 @@ def beautify_woman1_fft(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.nda
     return result, 20.0
 
 
-# ── WOMAN freckle / porcelain pipeline (updated fixes) ──────────────────────
+def _skin_norm_offset(geom: FaceGeometry, skin_mask: np.ndarray) -> Tuple[float, float]:
+    ys, xs = np.where(skin_mask > 128)
+    if len(xs) < 50:
+        return 0.0, 0.0
+    return (
+        (float(xs.mean()) - geom.cx) / max(geom.fw, 1),
+        (float(ys.mean()) - geom.cy) / max(geom.fh, 1),
+    )
 
-def _woman_skin_mask_u8(
+
+def _soft_jaw_taper_f(
+    shape: Tuple[int, int], geom: FaceGeometry, skin_mask: np.ndarray, cx: int, chin_y: int,
+) -> np.ndarray:
+    h, w = shape
+    dnx, dny = _skin_norm_offset(geom, skin_mask)
+    left = geom.point(0.22 + dnx, 0.80 + dny)
+    right = geom.point(0.78 + dnx, 0.80 + dny)
+    chin = geom.point(0.50 + dnx, 0.90 + dny)
+    chin_y = min(chin_y, int(chin[1]))
+    taper_y0 = int(geom.point(0.50 + dnx, 0.68 + dny)[1])
+    tri = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillConvexPoly(tri, np.array([left, right, chin], dtype=np.int32), 255)
+    tri_f = cv2.GaussianBlur(tri.astype(np.float32), (27, 27), 0) / 255.0
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    jaw_hw = max(int(geom.fw * 0.48), int(abs(right[0] - left[0]) // 2), 1)
+    t = np.clip((yy - taper_y0) / max(chin_y - taper_y0, 1), 0.0, 1.0)
+    half_w = jaw_hw * (1.0 - 0.90 * t)
+    xx = np.arange(w, dtype=np.float32)[None, :]
+    trap = (np.abs(xx - cx) <= half_w).astype(np.float32)
+    trap = np.maximum(trap, (yy <= taper_y0).astype(np.float32))
+    trap *= (yy <= chin_y + 3).astype(np.float32)
+    trap = cv2.GaussianBlur(trap, (21, 21), 0)
+    return np.clip(np.maximum(tri_f, trap), 0.0, 1.0)
+
+
+def _skin_face_oval_u8(
+    shape: Tuple[int, int], geom: FaceGeometry, skin_mask: np.ndarray,
+) -> np.ndarray:
+    h, w = shape
+    skin = skin_mask > 128
+    ys, xs = np.where(skin)
+    dnx, dny = _skin_norm_offset(geom, skin_mask)
+    if len(xs) >= 50:
+        cx = int(xs.mean())
+        cy = int(ys.mean())
+        x_span = int(xs.max() - xs.min())
+        y_span = int(ys.max() - ys.min())
+        rx = max(int(x_span * 0.60), int(geom.fw * 0.54), 1)
+        ry = max(int(y_span * 0.58), int(geom.fh * 0.56), 1)
+        chin_y = int(geom.point(0.50 + dnx, 0.90 + dny)[1])
+    else:
+        cx, cy = geom.cx, geom.cy
+        rx = max(1, int(geom.fw * 0.50))
+        ry = max(1, int(geom.fh * 0.54))
+        chin_y = int(geom.point(0.50 + dnx, 0.90 + dny)[1])
+    oval = np.zeros((h, w), dtype=np.uint8)
+    cv2.ellipse(oval, (cx, cy), (rx, ry), 0, 0, 360, 255, -1)
+    jaw = _soft_jaw_taper_f(shape, geom, skin_mask, cx, chin_y)
+    combined = (oval.astype(np.float32) / 255.0) * jaw
+    return np.clip(combined * 255.0, 0, 255).astype(np.uint8)
+
+
+# porcelain pipeline
+
+def _face_bbox_oval_u8(geom: FaceGeometry, shape: Tuple[int, int]) -> np.ndarray:
+    """Ellipse from detect_face_bboxes envelope — outer face boundary."""
+    h, w = shape
+    x1, y1, x2, y2 = geom.bbox
+    pad_x = int(0.08 * (x2 - x1))
+    pad_y = int(0.10 * (y2 - y1))
+    bx1, by1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+    bx2, by2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
+    bcx, bcy = (bx1 + bx2) // 2, (by1 + by2) // 2
+    brx, bry = max(1, (bx2 - bx1) // 2), max(1, (by2 - by1) // 2)
+    out = np.zeros(shape, dtype=np.uint8)
+    cv2.ellipse(out, (bcx, bcy), (brx, bry), 0, 0, 360, 255, -1)
+    return out
+
+
+def _blend_skin_mask_u8(
     geom: FaceGeometry, skin_mask: np.ndarray, shape: Tuple[int, int],
 ) -> np.ndarray:
+    """Skin oval + OpenCV HSV skin inside DNN/fallback bbox ellipse."""
     k9 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    face = _skin_face_oval_u8(shape, geom, skin_mask)
-    x1, y1, x2, y2 = geom.bbox
-    roi = np.zeros(shape, dtype=np.uint8)
-    pad = max(2, int(0.015 * (x2 - x1)))
-    roi[max(0, y1 - pad):min(shape[0], y2 + pad),
-        max(0, x1 - pad):min(shape[1], x2 + pad)] = 255
-    face = cv2.bitwise_and(face, roi)
+    k13 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    oval = _skin_face_oval_u8(shape, geom, skin_mask)
+    bbox_oval = _face_bbox_oval_u8(geom, shape)
+    expanded_skin = cv2.dilate(skin_mask, k13, iterations=2)
+    skin_in_face = cv2.bitwise_and(expanded_skin, bbox_oval)
+    face = cv2.bitwise_or(oval, skin_in_face)
+    face = cv2.bitwise_and(face, bbox_oval)
     inner = cv2.erode(face, k9, iterations=1)
     border = cv2.bitwise_and(face, cv2.bitwise_not(inner))
-    skin_near = cv2.dilate(skin_mask, k9, iterations=3)
+    skin_near = cv2.dilate(skin_mask, k9, iterations=4)
     border_keep = cv2.bitwise_and(border, skin_near)
     return cv2.bitwise_or(inner, border_keep)
 
 
-def _woman_skin_weights(
+def _blend_skin_weights(
     analysis: FaceAnalysis, shape: Tuple[int, int],
 ) -> Tuple[np.ndarray, np.ndarray]:
     geom = analysis.geom
-    base_u8 = _woman_skin_mask_u8(geom, analysis.skin_mask, shape)
+    base_u8 = _blend_skin_mask_u8(geom, analysis.skin_mask, shape)
     composite_w = _soft_mask(base_u8, 41)
     dist = cv2.distanceTransform(base_u8, cv2.DIST_L2, 5)
     t = np.clip(dist / 24.0, 0.0, 1.0)
@@ -1596,13 +1554,13 @@ def _woman_skin_weights(
     composite_w = composite_w * edge
     process_w = composite_w.copy()
     lum = cv2.cvtColor(analysis.bgr, cv2.COLOR_BGR2GRAY).astype(np.float64)
-    bg = (lum < 36.0) & (base_u8 == 0)
+    bg = (lum < 36.0) | ((lum > 170.0) & (lum < 210.0))
     composite_w[bg] = 0.0
     process_w[bg] = 0.0
     return np.clip(composite_w, 0.0, 1.0), np.clip(process_w, 0.0, 1.0)
 
 
-def _woman_brow_mask(
+def _brow_protect_mask(
     geom: FaceGeometry, shape: Tuple[int, int], skin_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     dnx, dny = _skin_norm_offset(geom, skin_mask) if skin_mask is not None else (0.0, 0.0)
@@ -1615,19 +1573,19 @@ def _woman_brow_mask(
     return out
 
 
-def _woman_freckle_mask(bgr: np.ndarray, skin_mask: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+def _freckle_bp_mask(bgr: np.ndarray, skin_mask: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
     L = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float64)
     return _freckle_mask_bandpass(L, skin_mask, shape)
 
 
-def _woman_freckle_target_mask(
+def _freckle_target_mask(
     bgr: np.ndarray,
     skin_mask: np.ndarray,
     flaw_mask: np.ndarray,
     geom: FaceGeometry,
     shape: Tuple[int, int],
 ) -> np.ndarray:
-    bp = _woman_freckle_mask(bgr, skin_mask, shape)
+    bp = _freckle_bp_mask(bgr, skin_mask, shape)
     compact = _filter_small_flaw_blobs(flaw_mask, shape, compact_only=False)
     merged = cv2.bitwise_or(compact, bp)
     merged = _exclude_features(merged, geom, shape)
@@ -1643,14 +1601,121 @@ def _woman_freckle_target_mask(
     return merged
 
 
-def beautify_woman_fft(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.ndarray, float]:
+def _lip_geometry_mask(
+    geom: FaceGeometry, shape: Tuple[int, int], dnx: float, dny: float,
+) -> np.ndarray:
+    """Mouth ellipse fallback when color-based lip detect is weak."""
+    h, w = shape
+    cx, cy = geom.point(0.50 + dnx, 0.71 + dny)
+    upper = np.zeros(shape, dtype=np.uint8)
+    lower = np.zeros(shape, dtype=np.uint8)
+    cv2.ellipse(
+        upper, (cx, cy - int(geom.fh * 0.015)),
+        (max(1, int(geom.fw * 0.10)), max(1, int(geom.fh * 0.030))),
+        0, 0, 360, 255, -1,
+    )
+    cv2.ellipse(
+        lower, (cx, cy + int(geom.fh * 0.024)),
+        (max(1, int(geom.fw * 0.11)), max(1, int(geom.fh * 0.034))),
+        0, 0, 360, 255, -1,
+    )
+    mouth = cv2.bitwise_or(upper, lower)
+    lip_f = cv2.GaussianBlur(mouth.astype(np.float32), (15, 15), 0) / 255.0
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    rx = max(geom.fw * 0.11, 1.0)
+    ry = max(geom.fh * 0.042, 1.0)
+    radial = np.exp(-0.5 * (((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2))
+    vert = np.exp(-0.5 * ((yy - cy) / (ry * 1.12)) ** 2)
+    return np.clip(lip_f * radial * (0.55 + 0.45 * vert), 0.0, 1.0)
+
+
+def _lip_gradient_mask(
+    bgr: np.ndarray,
+    geom: FaceGeometry,
+    skin_mask: np.ndarray,
+    shape: Tuple[int, int],
+    dnx: float,
+    dny: float,
+) -> np.ndarray:
+    """OpenCV lip detect (HSV + LAB a* + YCrCb Cr) + radial gradient."""
+    h, w = shape
+    cx, cy = geom.point(0.50 + dnx, 0.71 + dny)
+    upper = np.zeros(shape, dtype=np.uint8)
+    lower = np.zeros(shape, dtype=np.uint8)
+    cv2.ellipse(
+        upper, (cx, cy - int(geom.fh * 0.015)),
+        (max(1, int(geom.fw * 0.10)), max(1, int(geom.fh * 0.030))),
+        0, 0, 360, 255, -1,
+    )
+    cv2.ellipse(
+        lower, (cx, cy + int(geom.fh * 0.024)),
+        (max(1, int(geom.fw * 0.11)), max(1, int(geom.fh * 0.034))),
+        0, 0, 360, 255, -1,
+    )
+    mouth = cv2.bitwise_or(upper, lower)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    lip_hsv = cv2.bitwise_or(
+        cv2.inRange(hsv, np.array([0, 28, 32]), np.array([20, 255, 255])),
+        cv2.inRange(hsv, np.array([158, 28, 32]), np.array([180, 255, 255])),
+    )
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    lip_a = (lab[:, :, 1].astype(np.float32) > 132.0).astype(np.uint8) * 255
+    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    lip_cr = (ycrcb[:, :, 1].astype(np.float32) > 142.0).astype(np.uint8) * 255
+    lip_raw = cv2.bitwise_and(cv2.bitwise_or(lip_hsv, cv2.bitwise_or(lip_a, lip_cr)), mouth)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    lip_raw = cv2.morphologyEx(lip_raw, cv2.MORPH_CLOSE, k, iterations=2)
+    lip_raw = cv2.dilate(lip_raw, k, iterations=1)
+    if cv2.countNonZero(lip_raw) < 40:
+        return _lip_geometry_mask(geom, shape, dnx, dny)
+    lip_f = cv2.GaussianBlur(lip_raw.astype(np.float32), (17, 17), 0) / 255.0
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    rx = max(geom.fw * 0.11, 1.0)
+    ry = max(geom.fh * 0.042, 1.0)
+    radial = np.exp(-0.5 * (((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2))
+    vert = np.exp(-0.5 * ((yy - cy) / (ry * 1.12)) ** 2)
+    grad = lip_f * radial * (0.55 + 0.45 * vert)
+    return np.clip(
+        cv2.GaussianBlur(grad.astype(np.float32), (11, 11), 0).astype(np.float64),
+        0.0, 1.0,
+    )
+
+
+def _apply_lip_red_gradient(
+    result_bgr: np.ndarray,
+    original_bgr: np.ndarray,
+    geom: FaceGeometry,
+    skin_mask: np.ndarray,
+    dnx: float,
+    dny: float,
+) -> np.ndarray:
+    """Post-blend lip reddening — independent of skin composite weights."""
+    shape = result_bgr.shape[:2]
+    lip_w = _lip_gradient_mask(original_bgr, geom, skin_mask, shape, dnx, dny)
+    if float(np.max(lip_w)) < 0.04:
+        return result_bgr
+    lab_r = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2LAB).astype(np.float64)
+    lab_o = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2LAB).astype(np.float64)
+    L_o, a_o, b_o = lab_o[:, :, 0], lab_o[:, :, 1], lab_o[:, :, 2]
+    a_lip = np.clip(a_o * 0.35 + 162.0 * 0.65, 0, 255)
+    b_lip = np.clip(b_o * 0.30 + 145.0 * 0.70, 0, 255)
+    L_lip = np.clip(L_o * 0.86 + 18.0, 0, 255)
+    strength = lip_w * 0.92
+    lab_r[:, :, 0] = lab_r[:, :, 0] * (1.0 - lip_w * 0.22) + L_lip * (lip_w * 0.22)
+    lab_r[:, :, 1] = lab_r[:, :, 1] * (1.0 - strength) + a_lip * strength
+    lab_r[:, :, 2] = lab_r[:, :, 2] * (1.0 - strength) + b_lip * strength
+    return cv2.cvtColor(clip_to_uint8(lab_r), cv2.COLOR_LAB2BGR)
+
+
+def beautify_porcelain_fft(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.ndarray, float]:
     shape = bgr.shape[:2]
     geom = analysis.geom
     dnx, dny = _skin_norm_offset(geom, analysis.skin_mask)
-    composite_w, process_w = _woman_skin_weights(analysis, shape)
+    composite_w, process_w = _blend_skin_weights(analysis, shape)
     skin_px = composite_w > 0.12
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float64)
     L, a, b = lab[:, :, 0], lab[:, :, 1], lab[:, :, 2]
+    L_orig, a_orig, b_orig = L.copy(), a.copy(), b.copy()
     pad = _padded_shape(L.shape)
     h_bp = make_bandpass_kernel(pad, 4.0, 15.0)
     L_mid = apply_frequency_filter(L, h_bp)
@@ -1710,7 +1775,7 @@ def beautify_woman_fft(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.ndar
         )
     L_hp = apply_frequency_filter(L_out, make_highpass_kernel(pad, 9.0))
     L_out = np.clip(L_out + L_hp * eye_sharp * 0.14, 0, 255)
-    brow_zone = _woman_brow_mask(geom, shape, analysis.skin_mask)
+    brow_zone = _brow_protect_mask(geom, shape, analysis.skin_mask)
     L_orig = lab[:, :, 0]
     L_local_o = cv2.GaussianBlur(L_orig, (0, 0), 7.0)
     hair_w = np.clip((L_local_o - L_orig + 2.5) / 9.0, 0.0, 1.0) * brow_zone
@@ -1726,19 +1791,29 @@ def beautify_woman_fft(bgr: np.ndarray, analysis: FaceAnalysis) -> Tuple[np.ndar
         np.clip(L_out, 0, 255), np.clip(a_out, 0, 255), np.clip(b_out, 0, 255),
     ], axis=2)
     processed = cv2.cvtColor(clip_to_uint8(lab_out), cv2.COLOR_LAB2BGR).astype(np.float64)
-    w3 = np.stack([composite_w, composite_w, composite_w], axis=2)
-    delta = processed - bgr.astype(np.float64)
-    result = clip_to_uint8(bgr.astype(np.float64) + delta * w3)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    sat_ch = hsv[:, :, 1].astype(np.float64)
+    hair_gate = np.clip((L_orig - 95.0) / (135.0 - 95.0), 0.0, 1.0)
+    is_not_bg = np.clip(sat_ch / 12.0, 0.0, 1.0)
+    structural_gate = hair_gate * is_not_bg
+    final_blend_w = cv2.GaussianBlur(
+        composite_w * structural_gate, (31, 31), 0,
+    ).astype(np.float64)
+    w3 = np.stack([final_blend_w, final_blend_w, final_blend_w], axis=2)
+    result = clip_to_uint8(bgr.astype(np.float64) * (1.0 - w3) + processed * w3)
+    result = _apply_lip_red_gradient(
+        result, bgr, geom, analysis.skin_mask, dnx, dny,
+    )
     return result, sigma_lp
 
 
-# ── Subject orchestration ───────────────────────────────────────────────────
+# subject orchestration
 
-def _build_woman1_before_dict(analysis: FaceAnalysis) -> dict:
+def _build_acne_before_dict(analysis: FaceAnalysis) -> dict:
     bgr = analysis.bgr
     profile = analysis.profile
     shape = bgr.shape[:2]
-    restored, sigma_lp = restore_woman1_before(bgr, analysis)
+    restored, sigma_lp = restore_before_acne(bgr, analysis)
     ycrcb = cv2.cvtColor(restored, cv2.COLOR_BGR2YCrCb)
     y = ycrcb[:, :, 0].astype(np.float64)
     cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
@@ -1796,21 +1871,30 @@ def _build_after_dict_custom(
     }
 
 
+
+
+def _find_portrait(stem: str) -> str | None:
+    for base in (IMG_DIR, BASE_DIR):
+        for ext in (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"):
+            p = os.path.join(base, stem + ext)
+            if os.path.isfile(p):
+                return p
+    return None
+
 def _build_subjects() -> list:
+    pipeline_fns = {
+        "acne": beautify_acne_fft,
+        "porcelain": beautify_porcelain_fft,
+    }
     subjects: list = []
-    woman1_path = os.path.join(BASE_DIR, "images", "WOMAN1.jpg")
-    if not os.path.isfile(woman1_path):
-        woman1_path = os.path.join(BASE_DIR, "WOMAN1.jpg")
-    if os.path.isfile(woman1_path):
+    for job in PORTRAIT_JOBS:
+        stem = job["stem"]
+        pipeline = job["pipeline"]
+        path = _find_portrait(stem)
+        if path is None:
+            continue
         subjects.append((
-            "WOMAN1", woman1_path, PROFILES["red_blemish"], beautify_woman1_fft, "lp",
-        ))
-    woman_path = os.path.join(BASE_DIR, "images", "WOMAN.jpg")
-    if not os.path.isfile(woman_path):
-        woman_path = os.path.join(BASE_DIR, "WOMAN.jpg")
-    if os.path.isfile(woman_path):
-        subjects.append((
-            "WOMAN", woman_path, PROFILES["red_blemish"], beautify_woman_fft, "lp",
+            stem, path, PROFILES["red_blemish"], pipeline_fns[pipeline], "lp", pipeline,
         ))
     return subjects
 
@@ -1821,6 +1905,7 @@ def process_subject_custom(
     profile_override: BeautyProfile | None,
     beautify_fn,
     fft_mode: str = "lp",
+    pipeline: str = "default",
 ) -> dict:
     print(f"\nAnalyzing: {stem} ({os.path.basename(image_path)}) ...")
     original = _load_image(image_path)
@@ -1847,8 +1932,8 @@ def process_subject_custom(
         boxes, color = collect_enhancement_boxes(analysis)
         analysis.enhancement_boxes = boxes
         analysis.annotate_bgr = color
-    if stem == "WOMAN1":
-        flaw_mask = _woman1_acne_mask(
+    if pipeline == "acne":
+        flaw_mask = _acne_target_mask(
             analysis.bgr, analysis.skin_mask, analysis.geom, analysis.bgr.shape[:2],
         )
         analysis = FaceAnalysis(
@@ -1862,8 +1947,8 @@ def process_subject_custom(
         boxes, color = collect_enhancement_boxes(analysis)
         analysis.enhancement_boxes = boxes
         analysis.annotate_bgr = color
-    if stem == "WOMAN":
-        flaw_mask = _woman_freckle_target_mask(
+    elif pipeline == "porcelain":
+        flaw_mask = _freckle_target_mask(
             analysis.bgr,
             analysis.skin_mask,
             analysis.flaw_mask,
@@ -1887,9 +1972,11 @@ def process_subject_custom(
         f"  Face {analysis.geom.fw}x{analysis.geom.fh}px  mode={profile.flaw_mode}"
         f"  targets={n_targets}",
     )
-    targets_img = render_before_preview(analysis.bgr, analysis)
-    if stem == "WOMAN1":
-        before_d = _build_woman1_before_dict(analysis)
+    targets_img = render_before_preview(
+        analysis.bgr, analysis, show_face_outline=(pipeline == "porcelain"),
+    )
+    if pipeline == "acne":
+        before_d = _build_acne_before_dict(analysis)
     else:
         before_d = enhance_before(analysis)
     after_img, fft_sigma = beautify_fn(original, analysis)
@@ -1898,59 +1985,46 @@ def process_subject_custom(
     cv2.imwrite(os.path.join(OUT_DIR, f"{stem}_before.png"), before_d["image"])
     cv2.imwrite(os.path.join(OUT_DIR, f"{stem}_targets.png"), targets_img)
     cv2.imwrite(os.path.join(OUT_DIR, f"{stem}_after.png"), after_d["image"])
-    triptych = save_triptych_figure(stem, original, targets_img, after_d["image"], OUT_DIR)
+    save_triptych_figure(stem, original, targets_img, after_d["image"], OUT_DIR)
+    save_professor_figure(stem, original, after_d, OUT_DIR)
+    save_comparison_figure(stem, original, before_d, after_d, OUT_DIR)
+    save_pipeline_figure(stem, original, after_d, OUT_DIR)
+    save_filter_figure(stem, before_d, after_d, OUT_DIR)
+    save_hist_figure(stem, original, before_d["image"], after_d["image"], OUT_DIR)
+    save_difference_map(
+        stem, original, before_d["image"], after_d["image"], OUT_DIR,
+        analysis=after_d.get("analysis"),
+    )
+    save_spectrum_figure(stem, original, before_d["image"], after_d["image"], OUT_DIR)
+    save_rgb_channel_figure(stem, original, before_d["image"], after_d["image"], OUT_DIR)
     mb = compute_metrics(original, before_d["image"])
     ma = compute_metrics(original, after_d["image"])
     print(f"  Before - PSNR:{mb['PSNR']:.2f} dB  SSIM:{mb['SSIM']:.4f}")
     print(f"  After  - PSNR:{ma['PSNR']:.2f} dB  SSIM:{ma['SSIM']:.4f}  std:{ma['StdDev_enh']:.1f}")
-    return {
-        "name": stem,
-        "profile_name": profile.name,
-        "metrics_before": mb,
-        "metrics_after": ma,
-        "fig_professor": save_professor_figure(stem, original, after_d, OUT_DIR),
-        "fig_comparison": save_comparison_figure(stem, original, before_d, after_d, OUT_DIR),
-        "fig_pipeline": save_pipeline_figure(stem, original, after_d, OUT_DIR),
-        "fig_filters": save_filter_figure(stem, before_d, after_d, OUT_DIR),
-        "fig_hist": save_hist_figure(stem, original, before_d["image"], after_d["image"], OUT_DIR),
-        "fig_diff": save_difference_map(
-            stem, original, before_d["image"], after_d["image"], OUT_DIR,
-            analysis=after_d.get("analysis"),
-        ),
-        "fig_spec": save_spectrum_figure(stem, original, before_d["image"], after_d["image"], OUT_DIR),
-        "fig_rgb": save_rgb_channel_figure(stem, original, before_d["image"], after_d["image"], OUT_DIR),
-        "fig_triptych": triptych,
-    }
+    return {"name": stem, "profile_name": profile.name, "metrics_before": mb, "metrics_after": ma}
 
 
 def main():
     print("=" * 60)
-    print("HW2 — Frequency-Domain Facial Beautification (All Subjects)")
-    print("  WOMAN1: restoration (before) + acne tone / smooth skin (after)")
-    print("  WOMAN:  freckle FFT clear + porcelain lighten (after)")
+    print("Frequency-Domain Facial Beautification")
     print("=" * 60)
+
+    _ensure_dnn_weights()
 
     subjects = _build_subjects()
     if not subjects:
-        print("ERROR: No images found. Place WOMAN1.jpg / WOMAN.jpg in")
-        print(f"       the same folder as this script, or in: {IMG_DIR}")
+        stems = ", ".join(j["stem"] for j in PORTRAIT_JOBS)
+        print(f"ERROR: No portraits found. Expected: {stems}")
+        print(f"       Place images in: {IMG_DIR}")
         return
 
-    face_data_list: list = []
-    for stem, path, prof_override, fn, fft_mode in subjects:
+    for stem, path, prof_override, fn, fft_mode, pipeline in subjects:
         try:
-            fd = process_subject_custom(stem, path, prof_override, fn, fft_mode)
-            face_data_list.append(fd)
+            process_subject_custom(stem, path, prof_override, fn, fft_mode, pipeline)
         except Exception as exc:
             print(f"  SKIP {stem}: {exc}")
 
-    if face_data_list:
-        print("\nBuilding PDF report...")
-        pdf = build_report(face_data_list, OUT_DIR)
-        print(f"Report saved: {pdf}")
-
-    print(f"\nDone! All outputs in: {OUT_DIR}")
-
+    print(f"\nDone! Outputs in: {OUT_DIR}")
 
 
 if __name__ == "__main__":
