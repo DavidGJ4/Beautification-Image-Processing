@@ -1,0 +1,14 @@
+[project]
+name = "image-hwk2"
+version = "0.1.0"
+description = "Facial Image Beautification Using Frequency-Domain Techniques"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "matplotlib",
+    "scipy",
+    "Pillow",
+    "reportlab",
+    "scikit-image",
+]
